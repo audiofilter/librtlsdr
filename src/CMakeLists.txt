@@ -28,7 +28,15 @@ RTLSDR_APPEND_SRCS(
     tuner_fc0013.c
     tuner_fc2580.c
     tuner_r82xx.c
-)
+		)
+
+IF(APPLE)
+  #SET(GUI_TYPE MACOSX_BUNDLE)
+  INCLUDE_DIRECTORIES ( /Developer/Headers/FlatCarbon )
+  FIND_LIBRARY(AUDIOUNIT_LIBRARY AudioUnit)
+  MARK_AS_ADVANCED (AUDIOUNIT_LIBRARY)
+  SET(EXTRA_LIBS ${AUDIOUNIT_LIBRARY})
+ENDIF (APPLE)
 
 ########################################################################
 # Set up Windows DLL resource files
@@ -84,69 +92,18 @@ endif()
 ########################################################################
 # Build utility
 ########################################################################
-add_executable(rtl_sdr rtl_sdr.c)
-add_executable(rtl_tcp rtl_tcp.c)
-add_executable(rtl_test rtl_test.c)
-add_executable(rtl_fm rtl_fm.c)
-add_executable(rtl_eeprom rtl_eeprom.c)
-add_executable(rtl_adsb rtl_adsb.c)
-add_executable(rtl_power rtl_power.c)
-set(INSTALL_TARGETS rtlsdr_shared rtlsdr_static rtl_sdr rtl_tcp rtl_test rtl_fm rtl_eeprom rtl_adsb rtl_power)
+add_executable(fm_process fm_process.c demod_stuff.c)
+set(INSTALL_TARGETS rtlsdr_shared rtlsdr_static fm_process)
 
-target_link_libraries(rtl_sdr rtlsdr_shared convenience_static
+target_link_libraries(fm_process rtlsdr_shared convenience_static
     ${LIBUSB_LIBRARIES}
+    ${EXTRA_LIBS}
     ${CMAKE_THREAD_LIBS_INIT}
 )
-target_link_libraries(rtl_tcp rtlsdr_shared convenience_static
-    ${LIBUSB_LIBRARIES}
-    ${CMAKE_THREAD_LIBS_INIT}
-)
-target_link_libraries(rtl_test rtlsdr_shared convenience_static
-    ${LIBUSB_LIBRARIES}
-    ${CMAKE_THREAD_LIBS_INIT}
-)
-target_link_libraries(rtl_fm rtlsdr_shared convenience_static
-    ${LIBUSB_LIBRARIES}
-    ${CMAKE_THREAD_LIBS_INIT}
-)
-target_link_libraries(rtl_eeprom rtlsdr_shared convenience_static
-    ${LIBUSB_LIBRARIES}
-    ${CMAKE_THREAD_LIBS_INIT}
-)
-target_link_libraries(rtl_adsb rtlsdr_shared convenience_static
-    ${LIBUSB_LIBRARIES}
-    ${CMAKE_THREAD_LIBS_INIT}
-)
-target_link_libraries(rtl_power rtlsdr_shared convenience_static
-    ${LIBUSB_LIBRARIES}
-    ${CMAKE_THREAD_LIBS_INIT}
-)
-if(UNIX)
-target_link_libraries(rtl_fm m)
-target_link_libraries(rtl_adsb m)
-target_link_libraries(rtl_power m)
-if(APPLE)
-    target_link_libraries(rtl_test m)
-else()
-    target_link_libraries(rtl_test m rt)
-endif()
-endif()
 
 if(WIN32)
-target_link_libraries(rtl_sdr libgetopt_static)
-target_link_libraries(rtl_tcp ws2_32 libgetopt_static)
-target_link_libraries(rtl_test libgetopt_static)
-target_link_libraries(rtl_fm libgetopt_static)
-target_link_libraries(rtl_eeprom libgetopt_static)
-target_link_libraries(rtl_adsb libgetopt_static)
-target_link_libraries(rtl_power libgetopt_static)
-set_property(TARGET rtl_sdr APPEND PROPERTY COMPILE_DEFINITIONS "rtlsdr_STATIC" )
-set_property(TARGET rtl_tcp APPEND PROPERTY COMPILE_DEFINITIONS "rtlsdr_STATIC" )
-set_property(TARGET rtl_test APPEND PROPERTY COMPILE_DEFINITIONS "rtlsdr_STATIC" )
-set_property(TARGET rtl_fm APPEND PROPERTY COMPILE_DEFINITIONS "rtlsdr_STATIC" )
-set_property(TARGET rtl_eeprom APPEND PROPERTY COMPILE_DEFINITIONS "rtlsdr_STATIC" )
-set_property(TARGET rtl_adsb APPEND PROPERTY COMPILE_DEFINITIONS "rtlsdr_STATIC" )
-set_property(TARGET rtl_power APPEND PROPERTY COMPILE_DEFINITIONS "rtlsdr_STATIC" )
+target_link_libraries(fm_process libgetopt_static)
+set_property(TARGET fm_process APPEND PROPERTY COMPILE_DEFINITIONS "rtlsdr_STATIC" )
 endif()
 ########################################################################
 # Install built library files & utilities

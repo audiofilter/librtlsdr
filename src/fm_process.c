@@ -18,35 +18,8 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-
-
-/*
- * written because people could not do real time
- * FM demod on Atom hardware with GNU radio
- * based on rtl_sdr.c and rtl_tcp.c
- *
- * lots of locks, but that is okay
- * (no many-to-many locks)
- *
- * todo:
- *       sanity checks
- *       scale squelch to other input parameters
- *       test all the demodulations
- *       pad output on hop
- *       frequency ranges could be stored better
- *       scaled AM demod amplification
- *       auto-hop after time limit
- *       peak detector to tune onto stronger signals
- *       fifo for active hop frequency
- *       clips
- *       noise squelch
- *       merge stereo patch
- *       merge soft agc patch
- *       merge udp patch
- *       testmode to detect overruns
- *       watchdog to reset bad dongle
- *       fix oversampling
- */
+#include "fm_process.h"
+#include "demod_stuff.h"
 
 #include <errno.h>
 #include <signal.h>
@@ -56,122 +29,253 @@
 
 #ifndef _WIN32
 #include <unistd.h>
-#else
-#include <windows.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <netinet/in.h>
 #include <fcntl.h>
-#include <io.h>
-#include "getopt/getopt.h"
-#define usleep(x) Sleep(x/1000)
-#ifdef _MSC_VER
-#define round(x) (x > 0.0 ? floor(x + 0.5): ceil(x - 0.5))
-#endif
-#define _USE_MATH_DEFINES
+#else
+#include <winsock2.h>
 #endif
 
-#include <math.h>
 #include <pthread.h>
-#include <libusb.h>
 
-#include "rtl-sdr.h"
-#include "convenience/convenience.h"
+#ifdef _WIN32
+#pragma comment(lib, "ws2_32.lib")
+typedef int socklen_t;
+#else
+#define closesocket close
+#define SOCKADDR struct sockaddr
+#define SOCKET int
+#define SOCKET_ERROR -1
+#endif
 
-#define DEFAULT_SAMPLE_RATE		24000
-#define DEFAULT_BUF_LENGTH		(1 * 16384)
-#define MAXIMUM_OVERSAMPLE		16
-#define MAXIMUM_BUF_LENGTH		(MAXIMUM_OVERSAMPLE * DEFAULT_BUF_LENGTH)
-#define AUTO_GAIN			-100
-#define BUFFER_DUMP			4096
+static SOCKET s;
 
-#define FREQUENCIES_LIMIT		1000
+static pthread_t tcp_worker_thread;
+static pthread_t command_thread;
+static pthread_cond_t exit_cond;
+static pthread_mutex_t exit_cond_lock;
+
+static pthread_mutex_t ll_mutex;
+static pthread_cond_t cond;
+
+struct llist {
+	char *data;
+	size_t len;
+	struct llist *next;
+};
+
+static int global_numq = 0;
+static struct llist *ll_buffers = 0;
+static int llbuf_num = 500;
 
 static volatile int do_exit = 0;
+
+#ifdef _WIN32
+int gettimeofday(struct timeval *tv, void* ignored)
+{
+	FILETIME ft;
+	unsigned __int64 tmp = 0;
+	if (NULL != tv) {
+		GetSystemTimeAsFileTime(&ft);
+		tmp |= ft.dwHighDateTime;
+		tmp <<= 32;
+		tmp |= ft.dwLowDateTime;
+		tmp /= 10;
+#ifdef _MSC_VER
+		tmp -= 11644473600000000Ui64;
+#else
+		tmp -= 11644473600000000ULL;
+#endif
+		tv->tv_sec = (long)(tmp / 1000000UL);
+		tv->tv_usec = (long)(tmp % 1000000UL);
+	}
+	return 0;
+}
+
+BOOL WINAPI
+sighandler(int signum)
+{
+	if (CTRL_C_EVENT == signum) {
+		fprintf(stderr, "Signal caught, exiting!\n");
+		do_exit = 1;
+		return TRUE;
+	}
+	return FALSE;
+}
+#else
+static void sighandler(int signum)
+{
+	fprintf(stderr, "Signal caught, exiting!\n");
+	do_exit = 1;
+	exit(0);
+}
+#endif
+
+#ifdef PLAY_TONE
+const double freq = 440.0/32000.0;
+static long count=0;
+#endif
+
+void tcp_callback(int16_t* buf, int bytes, int len)
+{
+	if(!do_exit) {
+		struct llist *rpt = (struct llist*)malloc(sizeof(struct llist));
+
+		//printf("length is %d\n",len);
+#ifdef PLAY_TONE
+		for (int i=0;i<len;i++)	buf[i] = 2048.0*sin(2.0*M_PI*freq*count++);
+#endif
+		
+		rpt->data = (char*)malloc(len*bytes);
+		memcpy(rpt->data, buf, len*bytes);
+		rpt->len = len*bytes;
+		rpt->next = NULL;
+
+		pthread_mutex_lock(&ll_mutex);
+
+		if (ll_buffers == NULL) {
+			ll_buffers = rpt;
+		} else {
+			struct llist *cur = ll_buffers;
+			int num_queued = 0;
+
+			while (cur->next != NULL) {
+				cur = cur->next;
+				num_queued++;
+			}
+
+			if(llbuf_num && llbuf_num == num_queued-2){
+				struct llist *curelem;
+
+				free(ll_buffers->data);
+				curelem = ll_buffers->next;
+				free(ll_buffers);
+				ll_buffers = curelem;
+			}
+
+			cur->next = rpt;
+
+			if (num_queued > global_numq)
+				printf("ll+, now %d\n", num_queued);
+			else if (num_queued < global_numq)
+				printf("ll-, now %d\n", num_queued);
+
+			global_numq = num_queued;
+		}
+		pthread_cond_signal(&cond);
+		pthread_mutex_unlock(&ll_mutex);
+	}
+	usleep(1000);
+	
+}
+
+static void *tcp_worker(void *arg)
+{
+	struct llist *curelem,*prev;
+	int bytesleft,bytessent, index;
+	struct timeval tv= {1,0};
+	struct timespec ts;
+	struct timeval tp;
+	fd_set writefds;
+	int r = 0;
+
+	while(1) {
+		if(do_exit)
+			pthread_exit(0);
+
+		pthread_mutex_lock(&ll_mutex);
+		gettimeofday(&tp, NULL);
+		ts.tv_sec  = tp.tv_sec+5;
+		ts.tv_nsec = tp.tv_usec * 1000;
+		r = pthread_cond_timedwait(&cond, &ll_mutex, &ts);
+		if(r == ETIMEDOUT) {
+			pthread_mutex_unlock(&ll_mutex);
+			printf("worker cond timeout\n");
+			sighandler(0);
+			pthread_exit(NULL);
+		}
+
+		curelem = ll_buffers;
+		ll_buffers = 0;
+		pthread_mutex_unlock(&ll_mutex);
+
+		while(curelem != 0) {
+			bytesleft = curelem->len;
+			index = 0;
+			bytessent = 0;
+			while(bytesleft > 0) {
+				FD_ZERO(&writefds);
+				FD_SET(s, &writefds);
+				tv.tv_sec = 1;
+				tv.tv_usec = 0;
+				r = select(s+1, NULL, &writefds, NULL, &tv);
+				if(r) {
+					bytessent = send(s,  &curelem->data[index], bytesleft, 0);
+					bytesleft -= bytessent;
+					index += bytessent;
+				}
+				if(bytessent == SOCKET_ERROR || do_exit) {
+						printf("worker socket bye\n");
+						sighandler(0);
+						pthread_exit(NULL);
+				}
+			}
+			prev = curelem;
+			curelem = curelem->next;
+			free(prev->data);
+			free(prev);
+		}
+	}
+}
+
+#ifdef _WIN32
+#define __attribute__(x)
+#pragma pack(push, 1)
+#endif
+struct command{
+	unsigned char cmd;
+	unsigned int param;
+}__attribute__((packed));
+#ifdef _WIN32
+#pragma pack(pop)
+#endif
+static void *command_worker(void *arg)
+{
+	int left, received = 0;
+	fd_set readfds;
+	struct command cmd={0, 0};
+	struct timeval tv= {1, 0};
+	int r = 0;
+	uint32_t tmp;
+
+	while(1) {
+		left=sizeof(cmd);
+		while(left >0) {
+			FD_ZERO(&readfds);
+			FD_SET(s, &readfds);
+			tv.tv_sec = 1;
+			tv.tv_usec = 0;
+			r = select(s+1, &readfds, NULL, NULL, &tv);
+			if(r) {
+				received = recv(s, (char*)&cmd+(sizeof(cmd)-left), left, 0);
+				left -= received;
+			}
+			if(received == SOCKET_ERROR || do_exit) {
+				printf("comm recv bye\n");
+				sighandler(0);
+				pthread_exit(NULL);
+			}
+		}
+		printf("set command %d ? %d\n", cmd.cmd, ntohl(cmd.param));
+		cmd.cmd = 0xff;
+	}
+}
+
 static int lcm_post[17] = {1,1,1,3,1,5,3,7,1,9,5,11,3,13,7,15,1};
-static int ACTUAL_BUF_LENGTH;
-
-static int *atan_lut = NULL;
-static int atan_lut_size = 131072; /* 512 KB */
-static int atan_lut_coef = 8;
-
-struct dongle_state
-{
-	int      exit_flag;
-	pthread_t thread;
-	rtlsdr_dev_t *dev;
-	int      dev_index;
-	uint32_t freq;
-	uint32_t rate;
-	int      gain;
-	uint16_t buf16[MAXIMUM_BUF_LENGTH];
-	uint32_t buf_len;
-	int      ppm_error;
-	int      offset_tuning;
-	int      direct_sampling;
-	int      mute;
-	struct demod_state *demod_target;
-};
-
-struct demod_state
-{
-	int      exit_flag;
-	pthread_t thread;
-	int16_t  lowpassed[MAXIMUM_BUF_LENGTH];
-	int      lp_len;
-	int16_t  lp_i_hist[10][6];
-	int16_t  lp_q_hist[10][6];
-	int16_t  result[MAXIMUM_BUF_LENGTH];
-	int16_t  droop_i_hist[9];
-	int16_t  droop_q_hist[9];
-	int      result_len;
-	int      rate_in;
-	int      rate_out;
-	int      rate_out2;
-	int      now_r, now_j;
-	int      pre_r, pre_j;
-	int      prev_index;
-	int      downsample;    /* min 1, max 256 */
-	int      post_downsample;
-	int      output_scale;
-	int      squelch_level, conseq_squelch, squelch_hits, terminate_on_squelch;
-	int      downsample_passes;
-	int      comp_fir_size;
-	int      custom_atan;
-	int      deemph, deemph_a;
-	int      now_lpr;
-	int      prev_lpr_index;
-	int      dc_block, dc_avg;
-	void     (*mode_demod)(struct demod_state*);
-	pthread_rwlock_t rw;
-	pthread_cond_t ready;
-	pthread_mutex_t ready_m;
-	struct output_state *output_target;
-};
-
-struct output_state
-{
-	int      exit_flag;
-	pthread_t thread;
-	FILE     *file;
-	char     *filename;
-	int16_t  result[MAXIMUM_BUF_LENGTH];
-	int      result_len;
-	int      rate;
-	pthread_rwlock_t rw;
-	pthread_cond_t ready;
-	pthread_mutex_t ready_m;
-};
-
-struct controller_state
-{
-	int      exit_flag;
-	pthread_t thread;
-	uint32_t freqs[FREQUENCIES_LIMIT];
-	int      freq_len;
-	int      freq_now;
-	int      edge;
-	int      wb_mode;
-	pthread_cond_t hop;
-	pthread_mutex_t hop_m;
-};
 
 // multiple of these, eventually
 struct dongle_state dongle;
@@ -229,553 +333,10 @@ void usage(void)
 	exit(1);
 }
 
-#ifdef _WIN32
-BOOL WINAPI
-sighandler(int signum)
-{
-	if (CTRL_C_EVENT == signum) {
-		fprintf(stderr, "Signal caught, exiting!\n");
-		do_exit = 1;
-		rtlsdr_cancel_async(dongle.dev);
-		return TRUE;
-	}
-	return FALSE;
-}
-#else
-static void sighandler(int signum)
-{
-	fprintf(stderr, "Signal caught, exiting!\n");
-	do_exit = 1;
-	rtlsdr_cancel_async(dongle.dev);
-}
-#endif
-
 /* more cond dumbness */
 #define safe_cond_signal(n, m) pthread_mutex_lock(m); pthread_cond_signal(n); pthread_mutex_unlock(m)
 #define safe_cond_wait(n, m) pthread_mutex_lock(m); pthread_cond_wait(n, m); pthread_mutex_unlock(m)
 
-/* {length, coef, coef, coef}  and scaled by 2^15
-   for now, only length 9, optimal way to get +85% bandwidth */
-#define CIC_TABLE_MAX 10
-int cic_9_tables[][10] = {
-	{0,},
-	{9, -156,  -97, 2798, -15489, 61019, -15489, 2798,  -97, -156},
-	{9, -128, -568, 5593, -24125, 74126, -24125, 5593, -568, -128},
-	{9, -129, -639, 6187, -26281, 77511, -26281, 6187, -639, -129},
-	{9, -122, -612, 6082, -26353, 77818, -26353, 6082, -612, -122},
-	{9, -120, -602, 6015, -26269, 77757, -26269, 6015, -602, -120},
-	{9, -120, -582, 5951, -26128, 77542, -26128, 5951, -582, -120},
-	{9, -119, -580, 5931, -26094, 77505, -26094, 5931, -580, -119},
-	{9, -119, -578, 5921, -26077, 77484, -26077, 5921, -578, -119},
-	{9, -119, -577, 5917, -26067, 77473, -26067, 5917, -577, -119},
-	{9, -199, -362, 5303, -25505, 77489, -25505, 5303, -362, -199},
-};
-
-#ifdef _MSC_VER
-double log2(double n)
-{
-	return log(n) / log(2.0);
-}
-#endif
-
-void rotate_90(unsigned char *buf, uint32_t len)
-/* 90 rotation is 1+0j, 0+1j, -1+0j, 0-1j
-   or [0, 1, -3, 2, -4, -5, 7, -6] */
-{
-	uint32_t i;
-	unsigned char tmp;
-	for (i=0; i<len; i+=8) {
-		/* uint8_t negation = 255 - x */
-		tmp = 255 - buf[i+3];
-		buf[i+3] = buf[i+2];
-		buf[i+2] = tmp;
-
-		buf[i+4] = 255 - buf[i+4];
-		buf[i+5] = 255 - buf[i+5];
-
-		tmp = 255 - buf[i+6];
-		buf[i+6] = buf[i+7];
-		buf[i+7] = tmp;
-	}
-}
-
-void low_pass(struct demod_state *d)
-/* simple square window FIR */
-{
-	int i=0, i2=0;
-	while (i < d->lp_len) {
-		d->now_r += d->lowpassed[i];
-		d->now_j += d->lowpassed[i+1];
-		i += 2;
-		d->prev_index++;
-		if (d->prev_index < d->downsample) {
-			continue;
-		}
-		d->lowpassed[i2]   = d->now_r; // * d->output_scale;
-		d->lowpassed[i2+1] = d->now_j; // * d->output_scale;
-		d->prev_index = 0;
-		d->now_r = 0;
-		d->now_j = 0;
-		i2 += 2;
-	}
-	d->lp_len = i2;
-}
-
-int low_pass_simple(int16_t *signal2, int len, int step)
-// no wrap around, length must be multiple of step
-{
-	int i, i2, sum;
-	for(i=0; i < len; i+=step) {
-		sum = 0;
-		for(i2=0; i2<step; i2++) {
-			sum += (int)signal2[i + i2];
-		}
-		//signal2[i/step] = (int16_t)(sum / step);
-		signal2[i/step] = (int16_t)(sum);
-	}
-	signal2[i/step + 1] = signal2[i/step];
-	return len / step;
-}
-
-void low_pass_real(struct demod_state *s)
-/* simple square window FIR */
-// add support for upsampling?
-{
-	int i=0, i2=0;
-	int fast = (int)s->rate_out;
-	int slow = s->rate_out2;
-	while (i < s->result_len) {
-		s->now_lpr += s->result[i];
-		i++;
-		s->prev_lpr_index += slow;
-		if (s->prev_lpr_index < fast) {
-			continue;
-		}
-		s->result[i2] = (int16_t)(s->now_lpr / (fast/slow));
-		s->prev_lpr_index -= fast;
-		s->now_lpr = 0;
-		i2 += 1;
-	}
-	s->result_len = i2;
-}
-
-void fifth_order(int16_t *data, int length, int16_t *hist)
-/* for half of interleaved data */
-{
-	int i;
-	int16_t a, b, c, d, e, f;
-	a = hist[1];
-	b = hist[2];
-	c = hist[3];
-	d = hist[4];
-	e = hist[5];
-	f = data[0];
-	/* a downsample should improve resolution, so don't fully shift */
-	data[0] = (a + (b+e)*5 + (c+d)*10 + f) >> 4;
-	for (i=4; i<length; i+=4) {
-		a = c;
-		b = d;
-		c = e;
-		d = f;
-		e = data[i-2];
-		f = data[i];
-		data[i/2] = (a + (b+e)*5 + (c+d)*10 + f) >> 4;
-	}
-	/* archive */
-	hist[0] = a;
-	hist[1] = b;
-	hist[2] = c;
-	hist[3] = d;
-	hist[4] = e;
-	hist[5] = f;
-}
-
-void generic_fir(int16_t *data, int length, int *fir, int16_t *hist)
-/* Okay, not at all generic.  Assumes length 9, fix that eventually. */
-{
-	int d, temp, sum;
-	for (d=0; d<length; d+=2) {
-		temp = data[d];
-		sum = 0;
-		sum += (hist[0] + hist[8]) * fir[1];
-		sum += (hist[1] + hist[7]) * fir[2];
-		sum += (hist[2] + hist[6]) * fir[3];
-		sum += (hist[3] + hist[5]) * fir[4];
-		sum +=            hist[4]  * fir[5];
-		data[d] = sum >> 15 ;
-		hist[0] = hist[1];
-		hist[1] = hist[2];
-		hist[2] = hist[3];
-		hist[3] = hist[4];
-		hist[4] = hist[5];
-		hist[5] = hist[6];
-		hist[6] = hist[7];
-		hist[7] = hist[8];
-		hist[8] = temp;
-	}
-}
-
-/* define our own complex math ops
-   because ARMv5 has no hardware float */
-
-void multiply(int ar, int aj, int br, int bj, int *cr, int *cj)
-{
-	*cr = ar*br - aj*bj;
-	*cj = aj*br + ar*bj;
-}
-
-int polar_discriminant(int ar, int aj, int br, int bj)
-{
-	int cr, cj;
-	double angle;
-	multiply(ar, aj, br, -bj, &cr, &cj);
-	angle = atan2((double)cj, (double)cr);
-	return (int)(angle / 3.14159 * (1<<14));
-}
-
-int fast_atan2(int y, int x)
-/* pre scaled for int16 */
-{
-	int yabs, angle;
-	int pi4=(1<<12), pi34=3*(1<<12);  // note pi = 1<<14
-	if (x==0 && y==0) {
-		return 0;
-	}
-	yabs = y;
-	if (yabs < 0) {
-		yabs = -yabs;
-	}
-	if (x >= 0) {
-		angle = pi4  - pi4 * (x-yabs) / (x+yabs);
-	} else {
-		angle = pi34 - pi4 * (x+yabs) / (yabs-x);
-	}
-	if (y < 0) {
-		return -angle;
-	}
-	return angle;
-}
-
-int polar_disc_fast(int ar, int aj, int br, int bj)
-{
-	int cr, cj;
-	multiply(ar, aj, br, -bj, &cr, &cj);
-	return fast_atan2(cj, cr);
-}
-
-int atan_lut_init(void)
-{
-	int i = 0;
-
-	atan_lut = malloc(atan_lut_size * sizeof(int));
-
-	for (i = 0; i < atan_lut_size; i++) {
-		atan_lut[i] = (int) (atan((double) i / (1<<atan_lut_coef)) / 3.14159 * (1<<14));
-	}
-
-	return 0;
-}
-
-int polar_disc_lut(int ar, int aj, int br, int bj)
-{
-	int cr, cj, x, x_abs;
-
-	multiply(ar, aj, br, -bj, &cr, &cj);
-
-	/* special cases */
-	if (cr == 0 || cj == 0) {
-		if (cr == 0 && cj == 0)
-			{return 0;}
-		if (cr == 0 && cj > 0)
-			{return 1 << 13;}
-		if (cr == 0 && cj < 0)
-			{return -(1 << 13);}
-		if (cj == 0 && cr > 0)
-			{return 0;}
-		if (cj == 0 && cr < 0)
-			{return 1 << 14;}
-	}
-
-	/* real range -32768 - 32768 use 64x range -> absolute maximum: 2097152 */
-	x = (cj << atan_lut_coef) / cr;
-	x_abs = abs(x);
-
-	if (x_abs >= atan_lut_size) {
-		/* we can use linear range, but it is not necessary */
-		return (cj > 0) ? 1<<13 : -1<<13;
-	}
-
-	if (x > 0) {
-		return (cj > 0) ? atan_lut[x] : atan_lut[x] - (1<<14);
-	} else {
-		return (cj > 0) ? (1<<14) - atan_lut[-x] : -atan_lut[-x];
-	}
-
-	return 0;
-}
-
-void fm_demod(struct demod_state *fm)
-{
-	int i, pcm;
-	int16_t *lp = fm->lowpassed;
-	pcm = polar_discriminant(lp[0], lp[1],
-		fm->pre_r, fm->pre_j);
-	fm->result[0] = (int16_t)pcm;
-	for (i = 2; i < (fm->lp_len-1); i += 2) {
-		switch (fm->custom_atan) {
-		case 0:
-			pcm = polar_discriminant(lp[i], lp[i+1],
-				lp[i-2], lp[i-1]);
-			break;
-		case 1:
-			pcm = polar_disc_fast(lp[i], lp[i+1],
-				lp[i-2], lp[i-1]);
-			break;
-		case 2:
-			pcm = polar_disc_lut(lp[i], lp[i+1],
-				lp[i-2], lp[i-1]);
-			break;
-		}
-		fm->result[i/2] = (int16_t)pcm;
-	}
-	fm->pre_r = lp[fm->lp_len - 2];
-	fm->pre_j = lp[fm->lp_len - 1];
-	fm->result_len = fm->lp_len/2;
-}
-
-void am_demod(struct demod_state *fm)
-// todo, fix this extreme laziness
-{
-	int i, pcm;
-	int16_t *lp = fm->lowpassed;
-	int16_t *r  = fm->result;
-	for (i = 0; i < fm->lp_len; i += 2) {
-		// hypot uses floats but won't overflow
-		//r[i/2] = (int16_t)hypot(lp[i], lp[i+1]);
-		pcm = lp[i] * lp[i];
-		pcm += lp[i+1] * lp[i+1];
-		r[i/2] = (int16_t)sqrt(pcm) * fm->output_scale;
-	}
-	fm->result_len = fm->lp_len/2;
-	// lowpass? (3khz)  highpass?  (dc)
-}
-
-void usb_demod(struct demod_state *fm)
-{
-	int i, pcm;
-	int16_t *lp = fm->lowpassed;
-	int16_t *r  = fm->result;
-	for (i = 0; i < fm->lp_len; i += 2) {
-		pcm = lp[i] + lp[i+1];
-		r[i/2] = (int16_t)pcm * fm->output_scale;
-	}
-	fm->result_len = fm->lp_len/2;
-}
-
-void lsb_demod(struct demod_state *fm)
-{
-	int i, pcm;
-	int16_t *lp = fm->lowpassed;
-	int16_t *r  = fm->result;
-	for (i = 0; i < fm->lp_len; i += 2) {
-		pcm = lp[i] - lp[i+1];
-		r[i/2] = (int16_t)pcm * fm->output_scale;
-	}
-	fm->result_len = fm->lp_len/2;
-}
-
-void raw_demod(struct demod_state *fm)
-{
-	int i;
-	for (i = 0; i < fm->lp_len; i++) {
-		fm->result[i] = (int16_t)fm->lowpassed[i];
-	}
-	fm->result_len = fm->lp_len;
-}
-
-void deemph_filter(struct demod_state *fm)
-{
-	static int avg;  // cheating...
-	int i, d;
-	// de-emph IIR
-	// avg = avg * (1 - alpha) + sample * alpha;
-	for (i = 0; i < fm->result_len; i++) {
-		d = fm->result[i] - avg;
-		if (d > 0) {
-			avg += (d + fm->deemph_a/2) / fm->deemph_a;
-		} else {
-			avg += (d - fm->deemph_a/2) / fm->deemph_a;
-		}
-		fm->result[i] = (int16_t)avg;
-	}
-}
-
-void dc_block_filter(struct demod_state *fm)
-{
-	int i, avg;
-	int64_t sum = 0;
-	for (i=0; i < fm->result_len; i++) {
-		sum += fm->result[i];
-	}
-	avg = sum / fm->result_len;
-	avg = (avg + fm->dc_avg * 9) / 10;
-	for (i=0; i < fm->result_len; i++) {
-		fm->result[i] -= avg;
-	}
-	fm->dc_avg = avg;
-}
-
-int mad(int16_t *samples, int len, int step)
-/* mean average deviation */
-{
-	int i=0, sum=0, ave=0;
-	if (len == 0)
-		{return 0;}
-	for (i=0; i<len; i+=step) {
-		sum += samples[i];
-	}
-	ave = sum / (len * step);
-	sum = 0;
-	for (i=0; i<len; i+=step) {
-		sum += abs(samples[i] - ave);
-	}
-	return sum / (len / step);
-}
-
-int rms(int16_t *samples, int len, int step)
-/* largely lifted from rtl_power */
-{
-	int i;
-	long p, t, s;
-	double dc, err;
-
-	p = t = 0L;
-	for (i=0; i<len; i+=step) {
-		s = (long)samples[i];
-		t += s;
-		p += s * s;
-	}
-	/* correct for dc offset in squares */
-	dc = (double)(t*step) / (double)len;
-	err = t * 2 * dc - dc * dc * len;
-
-	return (int)sqrt((p-err) / len);
-}
-
-void arbitrary_upsample(int16_t *buf1, int16_t *buf2, int len1, int len2)
-/* linear interpolation, len1 < len2 */
-{
-	int i = 1;
-	int j = 0;
-	int tick = 0;
-	double frac;  // use integers...
-	while (j < len2) {
-		frac = (double)tick / (double)len2;
-		buf2[j] = (int16_t)(buf1[i-1]*(1-frac) + buf1[i]*frac);
-		j++;
-		tick += len1;
-		if (tick > len2) {
-			tick -= len2;
-			i++;
-		}
-		if (i >= len1) {
-			i = len1 - 1;
-			tick = len2;
-		}
-	}
-}
-
-void arbitrary_downsample(int16_t *buf1, int16_t *buf2, int len1, int len2)
-/* fractional boxcar lowpass, len1 > len2 */
-{
-	int i = 1;
-	int j = 0;
-	int tick = 0;
-	double remainder = 0;
-	double frac;  // use integers...
-	buf2[0] = 0;
-	while (j < len2) {
-		frac = 1.0;
-		if ((tick + len2) > len1) {
-			frac = (double)(len1 - tick) / (double)len2;}
-		buf2[j] += (int16_t)((double)buf1[i] * frac + remainder);
-		remainder = (double)buf1[i] * (1.0-frac);
-		tick += len2;
-		i++;
-		if (tick > len1) {
-			j++;
-			buf2[j] = 0;
-			tick -= len1;
-		}
-		if (i >= len1) {
-			i = len1 - 1;
-			tick = len1;
-		}
-	}
-	for (j=0; j<len2; j++) {
-		buf2[j] = buf2[j] * len2 / len1;}
-}
-
-void arbitrary_resample(int16_t *buf1, int16_t *buf2, int len1, int len2)
-/* up to you to calculate lengths and make sure it does not go OOB
- * okay for buffers to overlap, if you are downsampling */
-{
-	if (len1 < len2) {
-		arbitrary_upsample(buf1, buf2, len1, len2);
-	} else {
-		arbitrary_downsample(buf1, buf2, len1, len2);
-	}
-}
-
-void full_demod(struct demod_state *d)
-{
-	int i, ds_p;
-	int sr = 0;
-	ds_p = d->downsample_passes;
-	if (ds_p) {
-		for (i=0; i < ds_p; i++) {
-			fifth_order(d->lowpassed,   (d->lp_len >> i), d->lp_i_hist[i]);
-			fifth_order(d->lowpassed+1, (d->lp_len >> i) - 1, d->lp_q_hist[i]);
-		}
-		d->lp_len = d->lp_len >> ds_p;
-		/* droop compensation */
-		if (d->comp_fir_size == 9 && ds_p <= CIC_TABLE_MAX) {
-			generic_fir(d->lowpassed, d->lp_len,
-				cic_9_tables[ds_p], d->droop_i_hist);
-			generic_fir(d->lowpassed+1, d->lp_len-1,
-				cic_9_tables[ds_p], d->droop_q_hist);
-		}
-	} else {
-		low_pass(d);
-	}
-	/* power squelch */
-	if (d->squelch_level) {
-		sr = rms(d->lowpassed, d->lp_len, 1);
-		if (sr < d->squelch_level) {
-			d->squelch_hits++;
-			for (i=0; i<d->lp_len; i++) {
-				d->lowpassed[i] = 0;
-			}
-		} else {
-			d->squelch_hits = 0;}
-	}
-	d->mode_demod(d);  /* lowpassed -> result */
-	if (d->mode_demod == &raw_demod) {
-		return;
-	}
-	/* todo, fm noise squelch */
-	// use nicer filter here too?
-	if (d->post_downsample > 1) {
-		d->result_len = low_pass_simple(d->result, d->result_len, d->post_downsample);}
-	if (d->deemph) {
-		deemph_filter(d);}
-	if (d->dc_block) {
-		dc_block_filter(d);}
-	if (d->rate_out2 > 0) {
-		low_pass_real(d);
-		//arbitrary_resample(d->result, d->result, d->result_len, d->result_len * d->rate_out2 / d->rate_out);
-	}
-}
 
 static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 {
@@ -843,7 +404,8 @@ static void *output_thread_fn(void *arg)
 		// use timedwait and pad out under runs
 		safe_cond_wait(&s->ready, &s->ready_m);
 		pthread_rwlock_rdlock(&s->rw);
-		fwrite(s->result, 2, s->result_len, s->file);
+		//		fwrite(s->result, 2, s->result_len, s->file);
+		tcp_callback(s->result, 2, s->result_len);
 		pthread_rwlock_unlock(&s->rw);
 	}
 	return 0;
@@ -874,6 +436,7 @@ static void optimal_settings(int freq, int rate)
 		dm->output_scale = 1;}
 	d->freq = (uint32_t)capture_freq;
 	d->rate = (uint32_t)capture_rate;
+	//	fprintf(stderr, "Frequency is %d\n",d->freq);
 }
 
 static void *controller_thread_fn(void *arg)
@@ -1036,10 +599,64 @@ void sanity_checks(void)
 
 int main(int argc, char **argv)
 {
-#ifndef _WIN32
-	struct sigaction sigact;
+	char* addr = "127.0.0.1";
+	int port=1234;
+	int r, opt, i;
+	struct sockaddr_in local, remote;
+	uint32_t buf_num = 0;
+	struct llist *curelem,*prev;
+	pthread_attr_t attr;
+	void *status;
+	struct timeval tv = {1,0};
+	struct linger ling = {1,0};
+	SOCKET listensocket;
+	socklen_t rlen;
+	fd_set readfds;
+	u_long blockmode = 1;
+#ifdef _WIN32
+	WSADATA wsd;
+	i = WSAStartup(MAKEWORD(2,2), &wsd);
+#else
+	struct sigaction sigact, sigign;
 #endif
-	int r, opt;
+
+#ifndef _WIN32
+	sigact.sa_handler = sighandler;
+	sigemptyset(&sigact.sa_mask);
+	sigact.sa_flags = 0;
+	sigign.sa_handler = SIG_IGN;
+	sigaction(SIGINT, &sigact, NULL);
+	sigaction(SIGTERM, &sigact, NULL);
+	sigaction(SIGQUIT, &sigact, NULL);
+	sigaction(SIGPIPE, &sigign, NULL);
+#else
+	SetConsoleCtrlHandler( (PHANDLER_ROUTINE) sighandler, TRUE );
+#endif
+
+	pthread_mutex_init(&exit_cond_lock, NULL);
+	pthread_mutex_init(&ll_mutex, NULL);
+	pthread_mutex_init(&exit_cond_lock, NULL);
+	pthread_cond_init(&cond, NULL);
+	pthread_cond_init(&exit_cond, NULL);
+
+	memset(&local,0,sizeof(local));
+	local.sin_family = AF_INET;
+	local.sin_port = htons(port);
+	local.sin_addr.s_addr = inet_addr(addr);
+
+	listensocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	r = 1;
+	setsockopt(listensocket, SOL_SOCKET, SO_REUSEADDR, (char *)&r, sizeof(int));
+	setsockopt(listensocket, SOL_SOCKET, SO_LINGER, (char *)&ling, sizeof(ling));
+	bind(listensocket,(struct sockaddr *)&local,sizeof(local));
+
+#ifdef _WIN32
+	ioctlsocket(listensocket, FIONBIO, &blockmode);
+#else
+	r = fcntl(listensocket, F_GETFL, 0);
+	r = fcntl(listensocket, F_SETFL, r | O_NONBLOCK);
+#endif
+
 	int dev_given = 0;
 	int custom_ppm = 0;
 	dongle_init(&dongle);
@@ -1219,9 +836,6 @@ int main(int argc, char **argv)
 			exit(1);
 		}
 	}
-
-	//r = rtlsdr_set_testmode(dongle.dev, 1);
-
 	/* Reset endpoint before we start reading from it (mandatory) */
 	verbose_reset_buffer(dongle.dev);
 
@@ -1230,6 +844,32 @@ int main(int argc, char **argv)
 	pthread_create(&output.thread, NULL, output_thread_fn, (void *)(&output));
 	pthread_create(&demod.thread, NULL, demod_thread_fn, (void *)(&demod));
 	pthread_create(&dongle.thread, NULL, dongle_thread_fn, (void *)(&dongle));
+
+	printf("listening...\n");
+	printf("Use '%s:%d' \n",addr, port);
+	listen(listensocket,1);
+	while (!do_exit) {
+		FD_ZERO(&readfds);
+		FD_SET(listensocket, &readfds);
+		tv.tv_sec = 1;
+		tv.tv_usec = 0;
+		r = select(listensocket+1, &readfds, NULL, NULL, &tv);
+		if(!do_exit && r) {
+			rlen = sizeof(remote);
+			s = accept(listensocket,(struct sockaddr *)&remote, &rlen);
+			break;
+		}
+	}
+
+	setsockopt(s, SOL_SOCKET, SO_LINGER, (char *)&ling, sizeof(ling));
+	
+	printf("client accepted!\n");
+	
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+	r = pthread_create(&tcp_worker_thread, &attr, tcp_worker, NULL);
+	r = pthread_create(&command_thread, &attr, command_worker, NULL);
+	pthread_attr_destroy(&attr);
 
 	while (!do_exit) {
 		usleep(100000);
@@ -1258,7 +898,33 @@ int main(int argc, char **argv)
 		fclose(output.file);}
 
 	rtlsdr_close(dongle.dev);
+
+	pthread_join(tcp_worker_thread, &status);
+	pthread_join(command_thread, &status);
+
+	closesocket(s);
+	
+	printf("all threads dead..\n");
+	curelem = ll_buffers;
+	ll_buffers = 0;
+		
+	while(curelem != 0) {
+		prev = curelem;
+		curelem = curelem->next;
+		free(prev->data);
+		free(prev);
+	}
+	
+	do_exit = 0;
+	global_numq = 0;
+
+	closesocket(listensocket);
+	closesocket(s);
+#ifdef _WIN32
+	WSACleanup();
+#endif
+	printf("bye!\n");
 	return r >= 0 ? r : -r;
 }
 
-// vim: tabstop=8:softtabstop=8:shiftwidth=8:noexpandtab
+
